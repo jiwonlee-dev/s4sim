@@ -1,0 +1,26 @@
+ 
+
+Import('*')
+
+if env['TARGET_ISA'] == 'arm':
+     
+    SimObject('iSSD.py')
+ 
+    #    Host Interface 
+    Source('iSSDHostInterface.cc')
+    #Source('../../../../../../intelligent_ssd.cc')
+    DebugFlag('iSSDHostInterface')
+    DebugFlag('iSSDCtrlRegAccess')
+    DebugFlag('iSSDHostIntCmds')
+    DebugFlag('iSSDHostRead')
+    DebugFlag('iSSDHostWrite')
+
+    #	Nand Controller 
+    Source('iSSDNandCtrl.cc')
+    DebugFlag('iSSDNandCtrl')
+    DebugFlag('iSSDNandCtrlOP')
+
+    #	Statistic output 	
+    Source('iSSDStats.cc')
+
+

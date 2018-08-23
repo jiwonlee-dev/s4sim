@@ -1,0 +1,511 @@
+From 2b5374f2a193edf2c9a4644eb6af4d20f01e1d7f Mon Sep 17 00:00:00 2001
+From: Thomas Haywood <ekowhaywood@gmail.com>
+Date: Thu, 23 Aug 2018 15:26:51 +0000
+Subject: [PATCH] 02
+
+---
+ hw/block/nvme.c | 380 ++++++++++++++++++++++++++++++++++++++++++++++++++++++--
+ hw/block/nvme.h |   6 +-
+ 2 files changed, 372 insertions(+), 14 deletions(-)
+
+diff --git a/hw/block/nvme.c b/hw/block/nvme.c
+index d479fd2..dc9b9b5 100644
+--- a/hw/block/nvme.c
++++ b/hw/block/nvme.c
+@@ -19,7 +19,8 @@
+  *      -drive file=<file>,if=none,id=<drive_id>
+  *      -device nvme,drive=<drive_id>,serial=<serial>,id=<id[optional]>
+  */
+-
++#include <string.h>
++#include <sys/time.h>
+ #include "qemu/osdep.h"
+ #include "hw/block/block.h"
+ #include "hw/hw.h"
+@@ -30,8 +31,27 @@
+ #include "qapi/visitor.h"
+ #include "sysemu/block-backend.h"
+ 
++
++/*  S4Sim connection Implementations */
++#include "../../../../include/issd_types.h"
++#include "../../../../include/nvmeDataStructures.h"
++#include "../../../../include/host_ssd_interface.h"
++
+ #include "nvme.h"
+ 
++static volatile int using_s4sim = 0;
++static int nvme_init_with_s4sim (PCIDevice *pci_dev , NvmeCtrl *n );
++static void s4sim_disconnect(PCIDevice * , NvmeCtrl *);
++static uint64_t nvme_mmio_read_with_s4sim(void *opaque, hwaddr addr, unsigned size);
++static void nvme_mmio_write_with_s4sim(void *opaque, hwaddr addr, uint64_t data, unsigned size);
++static int setup_shared_memory(NvmeCtrl *n);
++static void* ssd_msg_check_thread (void *opaque);
++static void doorbell_collector ( hwaddr addr, uint64_t val) ;
++static int nsleep(long miliseconds);
++/*************************************/
++
++
++
+ static void nvme_process_sq(void *opaque);
+ 
+ static int nvme_check_sqid(NvmeCtrl *n, uint16_t sqid)
+@@ -739,17 +759,6 @@ static void nvme_write_bar(NvmeCtrl *n, hwaddr offset, uint64_t data,
+     }
+ }
+ 
+-static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
+-{
+-    NvmeCtrl *n = (NvmeCtrl *)opaque;
+-    uint8_t *ptr = (uint8_t *)&n->bar;
+-    uint64_t val = 0;
+-
+-    if (addr < sizeof(n->bar)) {
+-        memcpy(&val, ptr + addr, size);
+-    }
+-    return val;
+-}
+ 
+ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
+ {
+@@ -806,6 +815,18 @@ static void nvme_process_db(NvmeCtrl *n, hwaddr addr, int val)
+     }
+ }
+ 
++static uint64_t nvme_mmio_read(void *opaque, hwaddr addr, unsigned size)
++{
++    NvmeCtrl *n = (NvmeCtrl *)opaque;
++    uint8_t *ptr = (uint8_t *)&n->bar;
++    uint64_t val = 0;
++
++    if (addr < sizeof(n->bar)) {
++        memcpy(&val, ptr + addr, size);
++    }
++    return val;
++}
++
+ static void nvme_mmio_write(void *opaque, hwaddr addr, uint64_t data,
+     unsigned size)
+ {
+@@ -827,7 +848,7 @@ static const MemoryRegionOps nvme_mmio_ops = {
+     },
+ };
+ 
+-static int nvme_init(PCIDevice *pci_dev)
++static int nvme_init(PCIDevice *pci_dev )
+ {
+     NvmeCtrl *n = NVME(pci_dev);
+     NvmeIdCtrl *id = &n->id_ctrl;
+@@ -836,6 +857,12 @@ static int nvme_init(PCIDevice *pci_dev)
+     int64_t bs_size;
+     uint8_t *pci_conf;
+ 
++    // check if connecting to s4sim  
++    if( n->s4sim_shm && strlen(n->s4sim_shm)){   
++        return nvme_init_with_s4sim (pci_dev , n);
++    }
++    
++
+     if (!n->conf.blk) {
+         return -1;
+     }
+@@ -921,13 +948,21 @@ static int nvme_init(PCIDevice *pci_dev)
+             cpu_to_le64(n->ns_size >>
+                 id_ns->lbaf[NVME_ID_NS_FLBAS_INDEX(ns->id_ns.flbas)].ds);
+     }
++
+     return 0;
+ }
+ 
++
+ static void nvme_exit(PCIDevice *pci_dev)
+ {
+     NvmeCtrl *n = NVME(pci_dev);
+ 
++    if(using_s4sim){
++        msix_uninit_exclusive_bar(pci_dev);
++        s4sim_disconnect(pci_dev, n);
++        return ;
++    }
++
+     nvme_clear_ctrl(n);
+     g_free(n->namespaces);
+     g_free(n->cq);
+@@ -938,6 +973,7 @@ static void nvme_exit(PCIDevice *pci_dev)
+ static Property nvme_props[] = {
+     DEFINE_BLOCK_PROPERTIES(NvmeCtrl, conf),
+     DEFINE_PROP_STRING("serial", NvmeCtrl, serial),
++    DEFINE_PROP_STRING("s4sim_shm", NvmeCtrl, s4sim_shm),
+     DEFINE_PROP_END_OF_LIST(),
+ };
+ 
+@@ -988,3 +1024,321 @@ static void nvme_register_types(void)
+ }
+ 
+ type_init(nvme_register_types)
++
++
++
++
++
++
++
++
++
++/*  S4Sim connection Implementations */
++
++int   shmem ;
++size_t  shmem_size ;
++shmem_layout_t *shared_mem ;
++sim_meta_t *sim_meta ;
++db_update_queue_t  *db_queue ;
++ssd_msg_queue_t *msg_queue;
++page_queue_t   *page_queue ; 
++volatile nvmeCtrlReg  *nvmeReg ;
++volatile uint64_t read_value_mem = 0 ;
++pthread_t ssd_msg_check_thrd ; 
++
++FILE *sim_verbose_fd ;
++//#define print_src_line fprintf(stdout, " %s : %u \n", __FUNCTION__ ,__LINE__ );fflush(stdout);
++#define print_src_line 
++
++static uint64_t nvme_mmio_read_with_s4sim(void *opaque, hwaddr addr, unsigned size)
++{
++    print_src_line
++    memcpy( (void*)&read_value_mem , ((u8*)nvmeReg) + addr , size );
++    print_src_line 
++    return read_value_mem ;
++}
++
++static void nvme_mmio_write_with_s4sim(void *opaque, hwaddr addr, uint64_t data, unsigned size){
++    print_src_line
++    uint64_t val = data ;
++    memcpy( ((u8*)nvmeReg) + addr , &val , size );
++    if (addr >= 0x1000) {
++        doorbell_collector(addr, data);
++    }
++    print_src_line 
++    return ;
++}
++
++static const MemoryRegionOps nvme_mmio_ops_with_s4sim = {
++    .read = nvme_mmio_read_with_s4sim,
++    .write = nvme_mmio_write_with_s4sim,
++    .endianness = DEVICE_LITTLE_ENDIAN,
++    .impl = {
++        .min_access_size = 2,
++        .max_access_size = 8,
++    },
++};
++
++static int nvme_init_with_s4sim (PCIDevice *pci_dev , NvmeCtrl *n ){
++    
++    //int i;
++    //int64_t bs_size;
++    uint8_t *pci_conf;
++
++    sim_verbose_fd = stdout ;
++    fprintf( sim_verbose_fd , "\nConnect S4Sim Nvme Device \n ");
++    fflush(sim_verbose_fd) ;
++
++    using_s4sim = 1; 
++
++    //bs_size = blk_getlength(n->conf.blk);
++    //if (bs_size < 0) {
++    //    return -1;
++    //}
++
++    //blkconf_serial(&n->conf, &n->serial);
++    //if (!n->serial) {
++    //    return -1;
++    //}
++    //blkconf_blocksizes(&n->conf);
++    //blkconf_apply_backend_options(&n->conf);
++
++    pci_conf = pci_dev->config;
++    pci_conf[PCI_INTERRUPT_PIN] = 1;
++    pci_config_set_prog_interface(pci_dev->config, 0x2);
++    pci_config_set_class(pci_dev->config, PCI_CLASS_STORAGE_EXPRESS);
++    pcie_endpoint_cap_init(&n->parent_obj, 0x80);
++
++    n->num_namespaces = 1;
++    n->num_queues = 64;
++    n->reg_size = pow2ceil(0x1004 + 2 * (n->num_queues + 1) * 4);
++    //n->ns_size = bs_size / (uint64_t)n->num_namespaces;
++
++    //n->namespaces = g_new0(NvmeNamespace, n->num_namespaces);
++    //n->sq = g_new0(NvmeSQueue *, n->num_queues);
++    //n->cq = g_new0(NvmeCQueue *, n->num_queues);
++
++    memory_region_init_io(&n->iomem, OBJECT(n), &nvme_mmio_ops_with_s4sim, n,
++                          "nvme", n->reg_size);
++    pci_register_bar(&n->parent_obj, 0,
++        PCI_BASE_ADDRESS_SPACE_MEMORY | PCI_BASE_ADDRESS_MEM_TYPE_64,
++        &n->iomem);
++    msix_init_exclusive_bar(&n->parent_obj, n->num_queues, 4);
++
++    n->bar.vs = 0x00010100;
++    n->bar.intmc = n->bar.intms = 0;
++
++    return setup_shared_memory(n);
++    
++    //return 0;
++}
++
++static void s4sim_disconnect (PCIDevice *pci_dev , NvmeCtrl *n ){
++    fprintf(sim_verbose_fd ,  "\nRemoving nvme device : %s \n" , n->s4sim_shm  ); fflush(sim_verbose_fd);
++    using_s4sim = 0;
++    while(using_s4sim != -1 ){}
++    fprintf(sim_verbose_fd , " Done removing nvme device:%s \n" , n->s4sim_shm  ); fflush(sim_verbose_fd);
++    using_s4sim = 0 ;
++}
++
++static int setup_shared_memory(NvmeCtrl *n){
++
++    u8*     shmem_ptr ;
++    shmem_ptr = NULL ;
++
++    shmem_size = sizeof(struct SharedMemoryLayout);
++
++    fprintf(sim_verbose_fd, " Shared memory : %s\n",  n->s4sim_shm  );
++    fflush(sim_verbose_fd);
++
++    if(((shmem = shm_open( n->s4sim_shm, O_RDWR , 0666 ))>=0)){
++         shmem_ptr = (u8*)mmap(0, shmem_size, PROT_READ|PROT_WRITE, MAP_SHARED, shmem, 0);
++    }else{
++       fprintf(sim_verbose_fd , " ** [%s] shmem error, shmem:%d errno(%d):%s  ** \n",__FUNCTION__, shmem, errno, strerror(errno));
++       fflush(sim_verbose_fd);
++       return -1 ;
++    }
++     
++    fprintf(sim_verbose_fd , " shared memory attached successfuly :%d, ptr:%p size:%lu \n",shmem, shmem_ptr , shmem_size );
++    fflush(sim_verbose_fd);
++
++    shared_mem = ( shmem_layout_t *)shmem_ptr ;
++    sim_meta = & (shared_mem->sim_meta) ;
++    db_queue =  & (shared_mem->db_queue) ;
++    msg_queue =  & (shared_mem->msg_queue );
++    page_queue =  & (shared_mem->page_queue) ;
++    nvmeReg = & (shared_mem->nvmeReg );
++
++    if (sim_meta->simulation_status != 100){
++       return -1 ;
++    }
++ 
++    fprintf(sim_verbose_fd, " Nvme Simulator Name:%s\n", sim_meta->device_name );
++    fflush(sim_verbose_fd);
++
++    strcpy((char*)sim_meta->host_name , "QEMU HOST ") ;
++    sim_meta->host_started = 1 ;
++    sim_meta->simulation_status = 200 ;
++    
++    pthread_create(& ssd_msg_check_thrd  , NULL, ssd_msg_check_thread , (void*)n);
++
++    return 0 ;
++}
++
++
++static void* ssd_msg_check_thread (void *opaque){
++    print_src_line
++    NvmeCtrl *n = (NvmeCtrl *)opaque;
++     
++    fprintf(sim_verbose_fd, " Thread Started \n" );fflush(sim_verbose_fd);
++    ssd_msg_t * msg ;
++    page_reg_t* page ;
++
++
++    while(using_s4sim == 1){
++        
++        msg = deQueueSSDMsg  (msg_queue ) ;
++        
++        if (using_s4sim != 1) break ;
++
++        if (!msg){
++            nsleep(10);
++            continue;
++        }
++
++        while(! msg->msg_ready && using_s4sim == 1){}
++
++        if (using_s4sim != 1) break ;
++
++        switch(msg->registers.cmd){
++
++            case PCI_DMA_READ :  
++            case PCI_DMA_SQ_READ :
++                  print_src_line
++                  page = getPageRegister(page_queue , msg->page_index );  
++                  pci_dma_read(&n->parent_obj, msg->registers.dma_addr.raw , (void *) & page->data[0], msg->registers.size );  
++                  page->data_status = data_status_ready ;
++
++            break ;
++
++            case PCI_DMA_WRITE : 
++            case PCI_DMA_CQ_WRITE : 
++                print_src_line
++                page = getPageRegister(page_queue , msg->page_index );
++                
++                while (page->data_status != data_status_ready ){}
++                
++                pci_dma_write(&n->parent_obj,  msg->registers.dma_addr.raw , (void *)& page->data[0] , msg->registers.size);  
++                
++                page->data_status = data_status_used ;
++
++                if ( (msg->registers.cmd == PCI_DMA_CQ_WRITE) && (msg->registers.isr_notify) ){
++                    if (msix_enabled(&(n->parent_obj))) {
++                        msix_notify(&(n->parent_obj), msg->registers.cqIntVector );
++                    } else {
++                        pci_irq_pulse(&n->parent_obj);
++                    } 
++                }  
++                
++                break ;
++
++            case PCI_ENABLE_MSIX_VECTOR :
++                print_src_line
++                msix_vector_use(&n->parent_obj, msg->registers.cqIntVector);
++
++                /*
++                if(rcv_msg->registers.isr_enable)
++                {
++                     msix_vector_use(&n->parent_obj, rcv_msg->registers.cqIntVector);
++                }
++                else
++                {
++                    if(rcv_msg->registers.cqIntVector)
++                        msix_notify(&(n->parent_obj), rcv_msg->registers.cqIntVector);
++                    else
++                        pci_irq_pulse(&n->parent_obj);
++                }*/
++                break ;
++            
++            default:
++            print_src_line
++                break; 
++        }
++
++ 
++    }
++
++    fprintf(sim_verbose_fd, " Thread Exited \n" );fflush(sim_verbose_fd);
++    
++    munmap((void*)shared_mem , shmem_size);
++    shm_unlink( n->s4sim_shm );
++
++    using_s4sim = -1;
++
++    print_src_line
++    return NULL ;
++}
++
++
++static void doorbell_collector ( hwaddr addr, uint64_t val){
++    print_src_line
++    
++    uint32_t qid;
++    
++    if (addr & ((1 << 2) - 1)) {
++        return;
++    }
++
++    if (((addr - 0x1000) >> 2) & 1) {
++        
++        uint16_t new_head = val & 0xffff;
++        qid = (addr - (0x1000 + (1 << 2))) >> 3;
++        // queue the door bell
++        //ret = qemu_cq_db(qid, new_head);
++
++        dbUpdateReg dbu ;//= ( dbUpdateReg*) &data ; 
++        dbu.DoorBell = isCQ_DB ;
++        dbu.Qindex = (uint8_t)qid ;
++        dbu.db_value = (uint16_t) new_head ;
++        enQueueDBUpdate ( db_queue , &dbu ); //dev->db_updates.push(data);
++
++    } else {
++        
++        uint16_t new_tail = val & 0xffff;
++        qid = (addr - 0x1000) >> 3;
++        //ret = qemu_sq_db(qid, new_tail);
++        dbUpdateReg dbu ;//= ( dbUpdateReg*) &data ; 
++        dbu.DoorBell = isSQ_DB ;
++        dbu.Qindex = (uint8_t)qid ;
++        dbu.db_value = (uint16_t) new_tail ;
++        enQueueDBUpdate ( db_queue , &dbu );
++    }
++
++    print_src_line
++}
++
++
++
++static int nsleep(long miliseconds)
++{
++   struct timespec req, rem;
++
++   if(miliseconds > 999)
++   {   
++        req.tv_sec = (int)(miliseconds / 1000);                            /* Must be Non-Negative */
++        req.tv_nsec = (miliseconds - ((long)req.tv_sec * 1000)) * 1000000; /* Must be in range of 0 to 999999999 */
++   }   
++   else
++   {   
++        req.tv_sec = 0;                         /* Must be Non-Negative */
++        req.tv_nsec = miliseconds * 1000000;    /* Must be in range of 0 to 999999999 */
++   }   
++
++   return nanosleep(&req , &rem);
++}
++
++
++
++
++
++
+diff --git a/hw/block/nvme.h b/hw/block/nvme.h
+index 8fb0c10..56aae57 100644
+--- a/hw/block/nvme.h
++++ b/hw/block/nvme.h
+@@ -452,7 +452,7 @@ enum LogIdentifier {
+     NVME_LOG_SMART_INFO     = 0x02,
+     NVME_LOG_FW_SLOT_INFO   = 0x03,
+ };
+-
++/*
+ typedef struct NvmePSD {
+     uint16_t    mp;
+     uint16_t    reserved;
+@@ -499,6 +499,7 @@ typedef struct NvmeIdCtrl {
+     NvmePSD     psd[32];
+     uint8_t     vs[1024];
+ } NvmeIdCtrl;
++*/
+ 
+ enum NvmeIdCtrlOacs {
+     NVME_OACS_SECURITY  = 1 << 0,
+@@ -567,6 +568,7 @@ typedef struct NvmeRangeType {
+     uint8_t     rsvd48[16];
+ } NvmeRangeType;
+ 
++/*
+ typedef struct NvmeLBAF {
+     uint16_t    ms;
+     uint8_t     ds;
+@@ -588,6 +590,7 @@ typedef struct NvmeIdNs {
+     uint8_t     res192[192];
+     uint8_t     vs[3712];
+ } NvmeIdNs;
++*/
+ 
+ #define NVME_ID_NS_NSFEAT_THIN(nsfeat)      ((nsfeat & 0x1))
+ #define NVME_ID_NS_FLBAS_EXTENDED(flbas)    ((flbas >> 4) & 0x1)
+@@ -708,6 +711,7 @@ typedef struct NvmeCtrl {
+     NvmeSQueue      admin_sq;
+     NvmeCQueue      admin_cq;
+     NvmeIdCtrl      id_ctrl;
++    char            *s4sim_shm;
+ } NvmeCtrl;
+ 
+ #endif /* HW_NVME_H */
+-- 
+2.7.4
+
